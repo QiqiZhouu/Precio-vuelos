@@ -1,0 +1,935 @@
+---
+title: "Practica 1"
+author: "Qiqi Zhou"
+date: "2023-03-06"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Librerías necesarias para esta práctica:
+
+```{r}
+# Eliminar variables de la memoria
+rm(list = ls())
+
+# Paquetes
+library(skimr) # Resumen numérico
+library(tidymodels) # Depuración datos
+library(tidyverse) # Modelos
+library(outliers) # Outliers
+library(themis) # Sobremuestreo
+library(parallel) # Fase de validación
+library(doParallel) # Fase de validación
+library(rpart.plot) # Visualización de árboles
+library(performance)
+library(ggthemes)
+library(glue)
+library(vip)
+library(ggrepel)
+library(Rmisc)
+library(MASS)
+library(caret)
+library(MXM)
+library(Boruta)
+
+library(foreign)
+```
+
+## Importar fichero
+```{r}
+Vuelos= read_csv(file = "../archive-2/Clean_Dataset.csv")
+```
+
+# Análisis Exploratorio Inicial
+
+### Variables
+
+Nos hacemos una idea de las variables que tenemos y de sus tipos
+```{r}
+glimpse(Vuelos)
+```
+
+
+### Distribución variable objetivo "price"
+
+Vemos como están repartidas nuestra variable objetivo para saber el patrón que quizás pueda tener esos datos.
+```{r}
+Vuelos |> 
+  ggplot(aes(x = price)) +
+  geom_density(alpha = .8, fill="#EB9891") +
+  labs(title = "Distribución del precio de los vuelos", x = "Precio", y = NULL) +
+  theme_minimal() +
+  theme(text = element_text(face = "bold", size = 15), plot.title = element_text(hjust = 0.5), 
+        axis.title.x = element_text(vjust=-0.5)) + 
+  scale_x_continuous(labels = comma_format(big.mark = " ", decimal.mark = ",")) +
+  scale_y_continuous(labels = comma_format(big.mark = " ", decimal.mark = ",")) +
+  geom_vline(aes(xintercept = mean(price, na.rm = T), linetype = "Media"), colour = "black", size = .8) +
+  geom_vline(aes(xintercept = median(price, na.rm = T), linetype = "Mediana"), colour = "black", size = .8) + 
+  scale_linetype_manual(name = "Medidas", values = c(Media = "solid", Mediana = "dotted"))
+
+
+```
+
+
+# Análisis explotaratorio de datos
+### Datos ausentes en el dataset
+
+Comprobamos si en nuestro dataset tenemos o no datos ausentes 
+```{r}
+colSums(is.na(Vuelos))
+
+```
+
+Observamos que disponemos de una BD previa sin ningún dato missing en las ninguna de las variables
+
+### Factorizar
+
+Cambiamos nuestras variables categóricas a factor para ayudar al modelo a trabajar con un tipo de datos más óptimo
+```{r}
+Vuelos <-
+  Vuelos |> 
+  mutate_if(~!is.numeric(.), as.factor)
+```
+
+
+
+### Muestreo de datos
+
+Es donde muestreamos una parte de todo nuestros datos con el fin de en un principio mejorar la eficiencia y la rapidez de ejecución de nuestras predicciones además de que nos evitamos un posible sobreentrenamiento debido a la gran cantidad de datos que tenemos. Estas cantidades obtenidas en el muestreo cuando tengamos ya elaborado toda nuestra predicción podremos cambiarlo para ver con qué proporción nos da mejores resultados.
+```{r}
+set.seed(12345)
+
+vuelos_sample <-
+  Vuelos %>%
+  slice_sample(prop = 0.02) 
+```
+
+
+
+### División de particiones
+
+Esto quizas no haga falta por lo que se podria borrar completamente esta seccion
+
+Dividimos en 70% training y 30% en test
+```{r}
+vuelos_split <- initial_split(vuelos_sample, strata = price, prop = 0.7)
+vuelos_split
+```
+
+```{r}
+vuelos_train <- training(vuelos_split)
+vuelos_test <- testing(vuelos_split)
+```
+
+
+
+### Modificaciones antes del entrenamiento
+
+Eliminamos la primera variable ID que no nos sirve para crear nuestros modelos o red
+```{r}
+vuelos_train <- vuelos_train |> dplyr::select(-...1)
+```
+
+Comprobamos que realmente hemos borrado la primera variable de ID
+```{r}
+vuelos_train
+```
+
+
+
+### Receta tidy-verse para hacer modificaciones sobre el dataset
+
+Utilizamos una receta de tidyverse para hacer el preprosamiento de los datos.
+```{r}
+vuelos_rec_regresion <- 
+  recipe(data= vuelos_train, price ~ .) |> 
+  # agrupamos los casos de poca frecuencia en "otros"
+  step_other(all_nominal_predictors(), threshold = 0.1 , other = "otros") |> 
+  # aplicamos logaritmo a nuestro variable objetivo para mejorar el rendimiento
+  step_log(price, offset = 1) |> 
+  # estandarizamos las numericas para tener una desviacion entre 1 y media en 0
+  step_normalize(all_numeric_predictors()) |> 
+  # dummificamos las variables categóricas
+  step_dummy(all_nominal_predictors()) |> 
+  # filtro de cero varianza para eliminar variables que no "sirven"
+  step_zv(all_predictors())
+```
+
+
+Vemos los resultados después de aplicar la receta
+
+```{r}
+bake(vuelos_rec_regresion |> prep(), new_data = NULL)
+```
+
+
+
+# Seleccion de variables
+
+A continuación, vamos a realizar una selección de variables de todas las variables que tenemos, porque es muy probable que si utilizamos todas las variables podríamos estar haciendo un sobremuestreo, aparte de que puede haber variables que no ayudan o no sirvan en el modelo.
+
+Guardamos los datos dummificados y estandarizados y lo ajustamos 
+```{r}
+vuelos_prep <- bake(vuelos_rec_regresion |> prep(), new_data = NULL)
+
+ajuste_vuelos_regresion <- 
+  lm(data = vuelos_prep , price ~ .)
+```
+
+
+```{r}
+ajuste_vuelos_regresion
+```
+
+
+### AIC
+
+El modelo AIC de la librería MASS
+```{r}
+modAIC <- MASS::stepAIC(ajuste_vuelos_regresion, direction = "both", k =2 )
+```
+Step:  AIC=-9419.97
+price ~ duration + days_left + airline_Indigo + airline_Vistara + 
+    airline_otros + source_city_Chennai + source_city_Delhi + 
+    source_city_Hyderabad + source_city_Kolkata + source_city_Mumbai + 
+    departure_time_Early_Morning + departure_time_Morning + departure_time_Night + 
+    stops_zero + stops_otros + arrival_time_Evening + arrival_time_Night + 
+    arrival_time_otros + destination_city_Chennai + destination_city_Delhi + 
+    destination_city_Hyderabad + destination_city_Kolkata + class_Economy
+
+
+
+### BIC 
+```{r}
+modBIC <- MASS::stepAIC(ajuste_vuelos_regresion, k = log(nrow(vuelos_train)))
+```
+
+Step:  AIC=-9299.61
+price ~ duration + days_left + airline_Indigo + airline_Vistara + 
+    airline_otros + source_city_Hyderabad + source_city_Kolkata + 
+    departure_time_Early_Morning + departure_time_Morning + stops_zero + 
+    stops_otros + arrival_time_Evening + arrival_time_Night + 
+    arrival_time_otros + destination_city_Hyderabad + destination_city_Kolkata + 
+    class_Economy
+ 
+### SBF
+```{r}
+filtro<-sbf(data = vuelos_prep, price~. , sbfControl = sbfControl(functions = rfSBF, method = "cv", verbose = FALSE))
+
+a<-dput(filtro$optVariables)
+
+length(a)
+```
+c("duration", "days_left", "airline_Indigo", "airline_Vistara", 
+"airline_otros", "flight_otros", "departure_time_Morning", "departure_time_otros", 
+"stops_zero", "arrival_time_Evening", "arrival_time_Night", "arrival_time_otros", 
+"destination_city_Delhi", "destination_city_Kolkata", "class_Economy"
+)
+[1] 15
+
+
+### MXM
+```{r}
+data_mxm <- as.matrix(vuelos_prep)
+
+mmpc1 <- MMPC("price", dataset= data_mxm, max_k = 3, hash = TRUE, test = "testIndFisher")
+
+mmpc1@selectedVars
+
+a<-dput(names(vuelos_prep[,c(mmpc1@selectedVars)]))
+
+length(a)
+
+a
+```
+c("duration", "days_left", "airline_Vistara", "flight_otros", 
+"stops_zero", "stops_otros", "arrival_time_otros", "class_Economy"
+)
+[1] 8
+
+
+### RFE
+```{r}
+
+control <- rfeControl(functions=rfFuncs, method="cv", number=10)
+# run the RFE algorithm
+results <- rfe(data = vuelos_prep, price~. , sizes=c(1:8), rfeControl=control)
+
+selecrfe<-results$optVariables
+length(selecrfe)
+dput(selecrfe)
+```
+[1] 28
+c("days_left", "class_Economy", "duration", "source_city_Kolkata", 
+"destination_city_Kolkata", "stops_zero", "stops_otros", "airline_Vistara", 
+"source_city_Delhi", "destination_city_Mumbai", "destination_city_Hyderabad", 
+"arrival_time_otros", "airline_otros", "destination_city_Delhi", 
+"airline_Indigo", "destination_city_Chennai", "source_city_Hyderabad", 
+"departure_time_Morning", "arrival_time_Evening", "source_city_Mumbai", 
+"source_city_Chennai", "departure_time_Night", "arrival_time_Night", 
+"departure_time_Early_Morning", "departure_time_Evening", "arrival_time_Morning", 
+"flight_otros", "departure_time_otros")
+
+
+### Boruta
+```{r}
+
+out.boruta <- Boruta(price~., data = vuelos_prep)
+
+print(out.boruta)
+
+summary(out.boruta)
+
+sal<-data.frame(out.boruta$finalDecision)
+
+sal2<-sal[which(sal$out.boruta.finalDecision=="Confirmed"),,drop=FALSE]
+dput(row.names(sal2))
+
+length(dput(row.names(sal2)))
+```
+c("duration", "days_left", "airline_Indigo", "airline_Vistara", 
+"airline_otros", "flight_otros", "source_city_Delhi", "source_city_Hyderabad", 
+"source_city_Kolkata", "departure_time_Early_Morning", "departure_time_Evening", 
+"departure_time_Morning", "departure_time_Night", "stops_zero", 
+"stops_otros", "arrival_time_Evening", "arrival_time_Morning", 
+"arrival_time_Night", "arrival_time_otros", "destination_city_Delhi", 
+"destination_city_Hyderabad", "destination_city_Kolkata", "class_Economy"
+)
+[1] 23
+
+### SES
+
+
+```{r}
+SES1 <- SES("price" , dataset = data_mxm, max_k = 3, hash = TRUE, test = "testIndFisher")
+
+SES1@selectedVars
+
+a<-colnames(vuelos_prep[SES1@selectedVars])
+
+b<-dput(names(vuelos_prep[,c(SES1@selectedVars)]))
+
+length(a)
+b
+a
+```
+c("duration", "days_left", "airline_Vistara", "airline_otros", 
+"flight_otros", "stops_zero", "arrival_time_otros", "class_Economy"
+)
+[1] 8
+
+
+
+### Streprepetido AIC
+```{r}
+source("funcion steprepetido.R")
+```
+
+```{r}
+dput(names(vuelos_prep))
+```
+```{r}
+variablessindep <- c("duration", "days_left", "price", "airline_Indigo", "airline_Vistara", 
+"airline_otros", "flight_otros", "source_city_Chennai", "source_city_Delhi", 
+"source_city_Hyderabad", "source_city_Kolkata", "source_city_Mumbai", 
+"departure_time_Early_Morning", "departure_time_Evening", "departure_time_Morning", 
+"departure_time_Night", "departure_time_otros", "stops_zero", 
+"stops_otros", "arrival_time_Evening", "arrival_time_Morning", 
+"arrival_time_Night", "arrival_time_otros", "destination_city_Chennai", 
+"destination_city_Delhi", "destination_city_Hyderabad", "destination_city_Kolkata", 
+"destination_city_Mumbai", "class_Economy")
+```
+
+
+```{r}
+lista_step1<-steprepetido(data=vuelos_prep ,vardep=c("price"),
+                    listconti=variablessindep,
+                    sinicio=12345,sfinal=12385,porcen=0.8,criterio="AIC")
+```
+```{r}
+tabla1<-lista_step1[[1]]
+dput(lista_step1[[2]][[1]])
+dput(lista_step1[[2]][[2]])
+length(dput(lista_step1[[2]][[2]]))
+```
+c("class_Economy", "days_left", "stops_zero", "airline_Vistara", 
+"airline_otros", "airline_Indigo", "source_city_Kolkata", "destination_city_Kolkata", 
+"stops_otros", "arrival_time_otros", "destination_city_Hyderabad", 
+"source_city_Hyderabad", "departure_time_Morning", "duration", 
+"arrival_time_Morning", "departure_time_Early_Morning", "source_city_Chennai"
+)
+[1] 17
+
+
+
+### Streprepetido BIC
+```{r}
+lista_step2<-steprepetido(data=vuelos_prep ,vardep=c("price"),
+                    listconti=variablessindep,
+                    sinicio=12345,sfinal=12385,porcen=0.8,criterio="BIC")
+```
+
+```{r}
+tabla2<-lista_step2[[1]]
+dput(lista_step2[[2]][[1]])
+dput(lista_step2[[2]][[2]])
+length(dput(lista_step2[[2]][[2]]))
+```
+c("class_Economy", "days_left", "stops_zero", "airline_otros", 
+"airline_Indigo", "source_city_Kolkata", "destination_city_Kolkata", 
+"stops_otros", "airline_Vistara", "arrival_time_otros", "destination_city_Hyderabad", 
+"arrival_time_Morning", "source_city_Hyderabad", "duration", 
+"departure_time_Morning")
+[1] 15
+
+
+
+# COMPARACION VIA CV REPETIDA Y BOXPLOT
+
+Importamos las funciones del siguiente fichero para poder entrenar la red y la regresión
+```{r}
+source("cruzadas avnnet y lin.R")
+set.seed(12345)
+```
+
+A continuación, entrenamos la regresión para cada 
+
+### AIC
+```{r}
+medias1<-cruzadalin(data=vuelos_prep,
+                    vardep="price",listconti=
+                      c("duration" , "days_left" , "airline_Indigo" , "airline_Vistara" , 
+    "airline_otros" , "source_city_Chennai" , "source_city_Delhi" , 
+    "source_city_Hyderabad" , "source_city_Kolkata" , "source_city_Mumbai" , 
+    "departure_time_Early_Morning" , "departure_time_Morning" , "departure_time_Night" , 
+    "stops_zero" , "stops_otros" , "arrival_time_Evening" , "arrival_time_Night" , 
+    "arrival_time_otros" , "destination_city_Chennai" , "destination_city_Delhi" , 
+    "destination_city_Hyderabad" , "destination_city_Kolkata" , "class_Economy"
+
+),
+listclass=c(""),grupos=4,sinicio=1234,repe=25)
+
+medias1$modelo="STEPAIC"
+```
+
+### BIC
+```{r}
+medias2<-cruzadalin(data=vuelos_prep,
+                    vardep="price",listconti=
+                      c("duration" , "days_left" , "airline_Indigo" , "airline_Vistara" , 
+    "airline_otros" , "source_city_Hyderabad" , "source_city_Kolkata" , 
+    "departure_time_Early_Morning" , "departure_time_Morning" , "stops_zero" , 
+    "stops_otros" , "arrival_time_Evening" , "arrival_time_Night" , 
+    "arrival_time_otros" , "destination_city_Hyderabad" , "destination_city_Kolkata" , 
+    "class_Economy")
+                    ,
+                    listclass=c(""),grupos=4,sinicio=1234,repe=25)
+
+medias2$modelo="STEPBIC"
+```
+
+### STEPrep
+```{r}
+medias3<-cruzadalin(data=vuelos_prep,
+                    vardep="price",listconti=
+                       c("class_Economy", "days_left", "stops_zero", "airline_Vistara", 
+"airline_otros", "airline_Indigo", "source_city_Kolkata", "destination_city_Kolkata", 
+"stops_otros", "arrival_time_otros", "destination_city_Hyderabad", 
+"source_city_Hyderabad", "departure_time_Morning", "duration", 
+"arrival_time_Morning", "departure_time_Early_Morning", "source_city_Chennai"
+)
+                      ,
+                    listclass=c(""),grupos=4,sinicio=1234,repe=25)
+
+medias3$modelo="STEPrep1"
+```
+
+### STEPrep2
+```{r}
+medias4<-cruzadalin(data=vuelos_prep,
+                    vardep="price",listconti=
+                       c("class_Economy", "days_left", "stops_zero", "airline_otros", 
+"airline_Indigo", "source_city_Kolkata", "destination_city_Kolkata", 
+"stops_otros", "airline_Vistara", "arrival_time_otros", "destination_city_Hyderabad", 
+"arrival_time_Morning", "source_city_Hyderabad", "duration", 
+"departure_time_Morning"),
+                    listclass=c(""),grupos=4,sinicio=1234,repe=25)
+
+medias4$modelo="STEPrep2"
+```
+
+
+
+### SBF
+```{r}
+medias5<-cruzadalin(data=vuelos_prep,
+                    vardep="price",listconti=
+                       c("duration", "days_left", "airline_Indigo", "airline_Vistara", 
+"airline_otros", "flight_otros", "departure_time_Morning", "departure_time_otros", 
+"stops_zero", "arrival_time_Evening", "arrival_time_Night", "arrival_time_otros", 
+"destination_city_Delhi", "destination_city_Kolkata", "class_Economy"
+)
+,
+                      listclass=c(""),grupos=4,sinicio=1234,repe=25)
+
+medias5$modelo="SBF"
+```
+
+### RFE
+
+```{r}
+medias6<-cruzadalin(data=vuelos_prep,
+                    vardep="price",listconti=
+                       c("days_left", "class_Economy", "duration", "source_city_Kolkata", 
+"destination_city_Kolkata", "stops_zero", "stops_otros", "airline_Vistara", 
+"source_city_Delhi", "destination_city_Mumbai", "destination_city_Hyderabad", 
+"arrival_time_otros", "airline_otros", "destination_city_Delhi", 
+"airline_Indigo", "destination_city_Chennai", "source_city_Hyderabad", 
+"departure_time_Morning", "arrival_time_Evening", "source_city_Mumbai", 
+"source_city_Chennai", "departure_time_Night", "arrival_time_Night", 
+"departure_time_Early_Morning", "departure_time_Evening", "arrival_time_Morning", 
+"flight_otros", "departure_time_otros")
+                      ,
+                    listclass=c(""),grupos=4,sinicio=1234,repe=25)
+
+medias6$modelo="RFE"
+```
+
+
+### Boruta
+```{r}
+medias7<-cruzadalin(data=vuelos_prep,
+                    vardep="price",listconti=
+                       c("duration", "days_left", "airline_Indigo", "airline_Vistara", 
+"airline_otros", "flight_otros", "source_city_Delhi", "source_city_Hyderabad", 
+"source_city_Kolkata", "departure_time_Early_Morning", "departure_time_Evening", 
+"departure_time_Morning", "departure_time_Night", "stops_zero", 
+"stops_otros", "arrival_time_Evening", "arrival_time_Morning", 
+"arrival_time_Night", "arrival_time_otros", "destination_city_Delhi", 
+"destination_city_Hyderabad", "destination_city_Kolkata", "class_Economy"
+)
+                      ,
+                      listclass=c(""),grupos=4,sinicio=1234,repe=25)
+
+medias7$modelo="Boruta"
+```
+
+### MXM
+```{r}
+medias8<-cruzadalin(data=vuelos_prep,
+                    vardep="price",listconti=
+                       c("duration", "days_left", "airline_Vistara", "flight_otros", 
+"stops_zero", "stops_otros", "arrival_time_otros", "class_Economy"
+)
+                      ,
+                    listclass=c(""),grupos=4,sinicio=1234,repe=25)
+
+medias8$modelo="MXM-1"
+```
+
+### SES 
+```{r}
+medias10<-cruzadalin(data=vuelos_prep,
+                    vardep="price",listconti=
+                       c("duration", "days_left", "airline_Vistara", "airline_otros", 
+"flight_otros", "stops_zero", "arrival_time_otros", "class_Economy"
+)
+
+                      ,
+                    listclass=c(""),grupos=4,sinicio=1234,repe=25)
+
+medias10$modelo="SES"
+```
+
+
+### Grafica
+```{r}
+union1<-rbind(medias1,medias2,medias3,medias4,medias5,medias6,medias7, medias8, medias10)
+
+union1$error2<-sqrt(union1$error)
+
+par(cex.axis=1.2)
+boxplot(data=union1,col="pink",error2~modelo)
+```
+
+
+```{r}
+union1<-rbind(medias1,medias2,medias3,medias4,medias6,medias7)
+
+union1$error2<-sqrt(union1$error)
+
+par(cex.axis=1.2)
+boxplot(data=union1,col="pink",error2~modelo)
+```
+
+
+
+```{r}
+
+# **********************************************************************
+#  COMO AÑADIR ETIQUETAS CON EL NUMERO DE VARIABLES DE CADA MODELO
+# **********************************************************************
+
+# ESTO PARA DECIR CUANTAS VARIABLES TIENE CADA MODELO
+
+dput(names(table(union1$modelo)))
+
+
+nvar<-c(23,28,23,17,17,15)
+
+nvar2 <- paste(nvar, "var.")
+
+# ESTO PARA CONTROLAR LOS EJES Y POSICION DE LA ETIQUETA
+
+union1$error2<-sqrt(union1$error)
+
+
+max_error2 <- max(union1$error2)
+min_error2 <- min(union1$error2)
+num_modelos <- length(unique(union1$modelo))
+
+
+# Crear el boxplot y agregar las etiquetas
+par(cex.axis=0.6,las=2)
+boxplot(data=union1,col="pink",error2~modelo,main="error2",ylim=c(min_error2, max_error2*1.01))
+text(x = seq(1:num_modelos), y = rep(max_error2, num_modelos), labels = nvar2, pos = 3,col="red")
+axis(2, at=pretty(range(union1$error2),n=20))
+```
+### Resultados
+
+```{r}
+set.seed(12345)
+
+medias4$error
+```
+
+
+# Paralelización 
+```{r}
+clusters <- detectCores() - 1
+make_cluster <- makeCluster(clusters)
+registerDoParallel(make_cluster)
+```
+
+
+# Tuneo de red con STEPrepetido2
+```{r}
+
+vardep="price"
+variables<-c("class_Economy", "days_left", "stops_zero", "airline_otros", 
+"airline_Indigo", "source_city_Kolkata", "destination_city_Kolkata", 
+"stops_otros", "airline_Vistara", "arrival_time_otros", "destination_city_Hyderabad", 
+"arrival_time_Morning", "source_city_Hyderabad", "duration", 
+"departure_time_Morning")
+```
+
+```{r}
+paste(variables , collapse = "+")
+```
+
+# Tuneo de red con STEPrepetido1
+```{r}
+variables2 <- c("class_Economy", "days_left", "stops_zero", "airline_Vistara", 
+"airline_otros", "airline_Indigo", "source_city_Kolkata", "destination_city_Kolkata", 
+"stops_otros", "arrival_time_otros", "destination_city_Hyderabad", 
+"source_city_Hyderabad", "departure_time_Morning", "duration", 
+"arrival_time_Morning", "departure_time_Early_Morning", "source_city_Chennai"
+)
+```
+
+```{r}
+paste(variables2 , collapse = "+")
+```
+
+
+### Tuneo de grids
+
+```{r}
+data2 <- vuelos_prep[,c(variables,vardep)]
+data3 <- vuelos_prep[,c(variables2,vardep)]
+
+control<-trainControl(method = "repeatedcv",
+                      number=4,savePredictions = "all") 
+
+set.seed(12345)
+nnetgrid <-  expand.grid(size=c(5,10,15,20),decay=c(0.01,0.1,0.001,0.0001),bag=F)
+listaiter<-c(10,20,50,100,200,300,500,1000,2000,3000)
+
+```
+
+### Entrenamiento de red STEP2
+```{r}
+set.seed(12345)
+completo<-data.frame()
+
+#listaiter<-c(300,500,1000,2000,3000)
+### Segun la mejor es la 500 para que no tarde tanto cambiamos de momento a 500 pero recuerda cambiarlo de vuelta
+#listaiter<-c(500)
+for (iter in listaiter)
+{
+  rednnet<- train(price~ class_Economy+days_left+stops_zero+airline_otros+airline_Indigo+source_city_Kolkata+destination_city_Kolkata+stops_otros+airline_Vistara+arrival_time_otros+destination_city_Hyderabad+arrival_time_Morning+source_city_Hyderabad+duration+departure_time_Morning,
+                  data=data2,
+                  method="avNNet",linout = TRUE,maxit=iter,
+                  trControl=control,repeats=5,tuneGrid=nnetgrid,trace=F)
+  # Añado la columna del parametro de iteraciones
+  rednnet$results$itera<-iter
+  # Voy incorporando los resultados a completo
+  completo<-rbind(completo,rednnet$results)
+  
+  
+}
+```
+
+### Entrenamiento de red STEP1
+```{r}
+set.seed(12345)
+completo2<-data.frame()
+
+for (iter in listaiter)
+{
+  rednnet2<- train(price~ class_Economy+days_left+stops_zero+airline_Vistara+airline_otros+airline_Indigo+source_city_Kolkata+destination_city_Kolkata+stops_otros+arrival_time_otros+destination_city_Hyderabad+source_city_Hyderabad+departure_time_Morning+duration+arrival_time_Morning+departure_time_Early_Morning+source_city_Chennai,
+                  data=data3,
+                  method="avNNet",linout = TRUE,maxit=iter,
+                  trControl=control,repeats=5,tuneGrid=nnetgrid,trace=F)
+  # Añado la columna del parametro de iteraciones
+  rednnet2$results$itera<-iter
+  # Voy incorporando los resultados a completo
+  completo2<-rbind(completo2,rednnet2$results)
+  
+  
+}
+```
+
+
+### Eleccion del mejor red step2
+```{r}
+rednnet$pred <- rednnet$pred |> mutate(pred = exp(pred) , obs= exp(obs))
+```
+
+```{r}
+rednnet$bestTune
+```
+
+### Eleccion del mejor red step1
+```{r}
+rednnet2$pred <- rednnet2$pred |> mutate(pred = exp(pred) , obs= exp(obs))
+```
+
+```{r}
+rednnet2$bestTune
+```
+
+```{r}
+resultados_red1 <- rednnet$pred |> dplyr::filter(decay == 0.001 & size==10)
+
+resultados_red1
+```
+
+
+```{r}
+g1 <- resultados_red1 |> 
+  ggplot(mapping = aes(x = pred, y = obs)) +
+  geom_point(color = "#56BCC2", alpha = 0.6, size = 4) +
+  geom_abline(intercept = 0, slope = 1, color = "#EB9891", size = 1.2) +
+  theme_minimal() + 
+  labs(title = "Resultados de la regresión lineal multivariante con selección de modelos",
+       subtitle = "Los valores predichos deberían estar cercanos a la diagonal",
+       x = "Predicciones",
+       y = "Valores reales")
+
+g2 <- resultados_red1 |> 
+  dplyr::select(pred, obs) |> 
+  gather(Distribución, value) |> 
+  ggplot(aes(x = value, color = Distribución, fill = Distribución)) + 
+  geom_density(alpha = 0.6) + 
+  theme_minimal() + 
+  labs(title = "Distribución de las predicciones sobre los valores reales de SalePrice",
+       x = "Distribuciones",
+       y = "Frecuencia")
+
+multiplot(g1, g2)
+```
+
+
+```{r}
+completo<-completo[order(completo$RMSE),]
+
+ggplot(completo, aes(x=factor(itera), y=RMSE, 
+                     color=factor(decay),pch=factor(size))) +
+  geom_point(position=position_dodge(width=0.5),size=3)
+
+# nos quedamos con 20 nodos, aprox 30 obsw por parametro.
+
+completo_final<-completo[completo$size==10,]
+
+ggplot(completo_final, aes(x=factor(itera), y=RMSE, 
+                      color=factor(decay))) +
+  geom_point(position=position_dodge(width=0.5),size=3)
+```
+
+
+
+
+```{r}
+completo2<-completo2[order(completo2$RMSE),]
+
+ggplot(completo2, aes(x=factor(itera), y=RMSE, 
+                     color=factor(decay),pch=factor(size))) +
+  geom_point(position=position_dodge(width=0.5),size=3)
+
+# nos quedamos con 20 nodos, aprox 30 obsw por parametro.
+
+completo_final2<-completo2[completo2$size==10,]
+
+ggplot(completo_final2, aes(x=factor(itera), y=RMSE, 
+                      color=factor(decay))) +
+  geom_point(position=position_dodge(width=0.5),size=3)
+```
+
+
+
+
+# Red con los mejores parametros STEP2
+
+```{r}
+
+medias9<-cruzadaavnnet(data=data2,
+                       vardep="price",listconti=
+                         c("class_Economy", "days_left", "stops_zero", "airline_otros", 
+"airline_Indigo", "source_city_Kolkata", "destination_city_Kolkata", 
+"stops_otros", "airline_Vistara", "arrival_time_otros", "destination_city_Hyderabad", 
+"arrival_time_Morning", "source_city_Hyderabad", "duration", 
+"departure_time_Morning")                   ,
+                       listclass=c(""),grupos=4,sinicio=12345,repe=25,repeticiones=5,itera=500,
+                       size=c(10),decay=c(0.001))
+
+medias9$modelo="Red_STEP2"
+```
+
+# Red con los mejores parametros STEP1
+
+```{r}
+
+medias11<-cruzadaavnnet(data=data3,
+                       vardep="price",listconti=
+                         c("class_Economy", "days_left", "stops_zero", "airline_Vistara", 
+"airline_otros", "airline_Indigo", "source_city_Kolkata", "destination_city_Kolkata", 
+"stops_otros", "arrival_time_otros", "destination_city_Hyderabad", 
+"source_city_Hyderabad", "departure_time_Morning", "duration", 
+"arrival_time_Morning", "departure_time_Early_Morning", "source_city_Chennai"
+)                  ,
+                       listclass=c(""),grupos=4,sinicio=12345,repe=25,repeticiones=5,itera=500,
+                       size=c(10),decay=c(0.001))
+
+medias11$modelo="Red_STEP1"
+```
+
+
+# Grafico junto con la red
+
+
+```{r}
+union1<-rbind(medias1,medias2,medias3,medias4,medias5,medias6,medias7,medias8,medias9, medias10, medias11)
+
+union1$error2<-sqrt(union1$error)
+
+par(cex.axis=1.2)
+boxplot(data=union1,col="pink",error2~modelo) 
+```
+
+
+
+## Predict 
+
+Necesitamos tambien dummificar las variables del test para que coincidan con el train
+```{r}
+vuelos_testprueba <- bake(vuelos_rec_regresion |> prep(), new_data = vuelos_test)
+
+```
+
+### Mejor red para prediccion
+```{r}
+gridpredict <-  expand.grid(size=c(10),decay=c(0.001),bag=F)
+```
+
+
+```{r}
+rednnet_prediccion<- train(price~ class_Economy+days_left+stops_zero+airline_otros+airline_Indigo+source_city_Kolkata+destination_city_Kolkata+stops_otros+airline_Vistara+arrival_time_otros+destination_city_Hyderabad+arrival_time_Morning+source_city_Hyderabad+duration+departure_time_Morning,
+                  data=data2,
+                  method="avNNet",linout = TRUE,maxit=500,
+                  trControl=control,repeats=5,tuneGrid=gridpredict,trace=F)
+```
+
+```{r}
+prediccion_red1 <- predict(rednnet_prediccion, vuelos_testprueba )
+```
+
+
+
+### Calculo de MSE
+```{r}
+comple<-cbind(vuelos_testprueba,prediccion_red1)
+
+comple$error<-(comple$price-comple$prediccion_red1)^2
+
+MSE<-mean(comple$error)
+RMSE<-sqrt(MSE)
+```
+
+```{r}
+MSE
+RMSE
+
+```
+
+
+
+### Grafica de prediccion
+```{r}
+comparacion <- data.frame(Prediccion = prediccion_red1, Real = vuelos_testprueba$price)
+```
+
+```{r}
+comparacion_alcuadrado <- comparacion |> mutate(Prediccion = exp(Prediccion) , Real= exp(Real))
+```
+
+
+```{r}
+g1 <- comparacion_alcuadrado |> 
+  ggplot(mapping = aes(x = Prediccion, y = Real)) +
+  geom_point(color = "#56BCC2", alpha = 0.6, size = 4) +
+  geom_abline(intercept = 0, slope = 1, color = "#EB9891", size = 1.2) +
+  theme_minimal() + 
+  labs(title = "Resultados de la mejor Red Neuronal",
+       subtitle = "Los valores predichos deberían estar cercanos a la diagonal",
+       x = "Predicciones",
+       y = "Valores reales")
+
+g2 <- comparacion_alcuadrado |> 
+  dplyr::select(Prediccion, Real) |> 
+  gather(Distribución, value) |> 
+  ggplot(aes(x = value, color = Distribución, fill = Distribución)) + 
+  geom_density(alpha = 0.6) + 
+  theme_minimal() + 
+  labs(title = "Distribución de las predicciones sobre los valores reales de price",
+       x = "Distribuciones",
+       y = "Frecuencia")
+
+multiplot(g1, g2)
+```
+
+
+# Paasar datos a SAS para la creación de modelos
+
+```{r}
+# Pasar los datos a SAS 
+
+write.dbf(as.data.frame(vuelos_prep), "/Users/qiqizhou/Desktop/Segundo cuatri/Machine learning/Trabajo1/archive-2/train.dbf")
+write.dbf(as.data.frame(vuelos_testprueba),"/Users/qiqizhou/Desktop/Segundo cuatri/Machine learning/Trabajo1/archive-2/test.dbf")
+```
+
