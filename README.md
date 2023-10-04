@@ -12,6 +12,10 @@ vuelo. Esta base de datos tiene en total una cantidad de 300261 observaciones co
 variables basadas en vuelos entre las seis principales ciudades metropolitanas de India.
 
 # Dataset 
-(Data tonto)[https://www.kaggle.com/datasets/shubhambathwal/flight-price-prediction]
+https://www.kaggle.com/datasets/shubhambathwal/flight-price-prediction
 
 # Algoritmos utilizados
+- Selección de variables
+- Tuneo de grid
+- Regresión
+- Redes neuronales
